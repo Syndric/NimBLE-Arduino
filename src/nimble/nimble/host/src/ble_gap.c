@@ -296,7 +296,6 @@ static uint8_t pawr_adv_handle;
 static uint16_t pawr_sync_handle;
 #endif
 
-int slave_conn[MYNEWT_VAL(BLE_MAX_CONNECTIONS) + 1];
 static void ble_gap_update_entry_free(struct ble_gap_update_entry *entry);
 
 #if NIMBLE_BLE_CONNECT
@@ -323,10 +322,98 @@ static int ble_gap_conn_cancel_tx(void);
 static int ble_gap_disc_enable_tx(int enable, int filter_duplicates);
 #endif
 
-uint16_t g_max_tx_time[MYNEWT_VAL(BLE_MAX_CONNECTIONS) + 1];
-uint16_t g_max_rx_time[MYNEWT_VAL(BLE_MAX_CONNECTIONS) + 1 ];
-uint16_t g_max_tx_octets[MYNEWT_VAL(BLE_MAX_CONNECTIONS) + 1];
-uint16_t g_max_rx_octets[MYNEWT_VAL(BLE_MAX_CONNECTIONS) + 1];
+/* Per-connection scratch data (slave-role connect/disconnect bookkeeping,
+ * last-negotiated data-length values) formerly lived in flat arrays indexed
+ * directly by the controller-assigned conn_handle. That handle is NOT a
+ * compact slot number -- it keeps climbing across connect/disconnect churn
+ * (the controller hands out a rolling value, it does not eagerly reuse the
+ * lowest free one) and routinely exceeds BLE_MAX_CONNECTIONS well before
+ * BLE_MAX_CONNECTIONS connections are ever simultaneously active. Indexing
+ * by raw conn_handle either corrupts adjacent globals (unguarded) or, once
+ * guarded, silently stops tracking any connection whose handle spilled over
+ * (guarded-but-wrong). Fix: allocate a slot per *active* connection instead
+ * of per handle value, freed on disconnect, bounded to the real number of
+ * simultaneous connections the host ever has.
+ */
+struct ble_gap_conn_track {
+    uint16_t conn_handle;              /* BLE_HS_CONN_HANDLE_NONE if free */
+    uint8_t slave_conn;
+    uint16_t max_tx_time;
+    uint16_t max_rx_time;
+    uint16_t max_tx_octets;
+    uint16_t max_rx_octets;
+};
+
+static struct ble_gap_conn_track
+    ble_gap_conn_tracks[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
+
+static struct ble_gap_conn_track *
+ble_gap_conn_track_find(uint16_t conn_handle)
+{
+    int i;
+
+    for (i = 0; i < MYNEWT_VAL(BLE_MAX_CONNECTIONS); i++) {
+        if (ble_gap_conn_tracks[i].conn_handle == conn_handle) {
+            return &ble_gap_conn_tracks[i];
+        }
+    }
+
+    return NULL;
+}
+
+/* Finds the slot for conn_handle, allocating a free one on first use. */
+static struct ble_gap_conn_track *
+ble_gap_conn_track_alloc(uint16_t conn_handle)
+{
+    struct ble_gap_conn_track *track;
+    int i;
+
+    track = ble_gap_conn_track_find(conn_handle);
+    if (track != NULL) {
+        return track;
+    }
+
+    for (i = 0; i < MYNEWT_VAL(BLE_MAX_CONNECTIONS); i++) {
+        if (ble_gap_conn_tracks[i].conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+            memset(&ble_gap_conn_tracks[i], 0, sizeof ble_gap_conn_tracks[i]);
+            ble_gap_conn_tracks[i].conn_handle = conn_handle;
+            return &ble_gap_conn_tracks[i];
+        }
+    }
+
+    /* Host already caps active connections at BLE_MAX_CONNECTIONS, so every
+     * slot being taken here means conn_handle wasn't freed on some earlier
+     * disconnect -- a real leak, not just a big handle number.
+     */
+    BLE_HS_LOG(ERROR, "ble_gap_conn_track_alloc: no free slot for "
+                       "conn_handle=%d\n", conn_handle);
+    return NULL;
+}
+
+static void
+ble_gap_conn_track_free(uint16_t conn_handle)
+{
+    struct ble_gap_conn_track *track;
+
+    track = ble_gap_conn_track_find(conn_handle);
+    if (track != NULL) {
+        track->conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+}
+
+/* Whether ble_gap_rx_rd_rem_sup_feat_complete confirmed a connect event was
+ * sent for this (slave-role) conn_handle. Used by ble_hs_hci_evt.c to decide
+ * whether a disconnect-complete with a supervision-timeout reason should
+ * trigger an advertising restart. Untracked handle (never connected, or
+ * already torn down) reads as 0, same as the old zero-initialized array.
+ */
+int
+ble_gap_conn_track_is_slave_conn(uint16_t conn_handle)
+{
+    struct ble_gap_conn_track *track = ble_gap_conn_track_find(conn_handle);
+
+    return track != NULL && track->slave_conn;
+}
 
 STATS_SECT_DECL(ble_gap_stats) ble_gap_stats;
 STATS_NAME_START(ble_gap_stats)
@@ -1601,8 +1688,10 @@ ble_gap_conn_broken(uint16_t conn_handle, int reason)
 
     // Send disconnect event in slave role if connect was sent
     if ((conn != NULL) &&  !(conn->bhc_flags & BLE_HS_CONN_F_MASTER)) {
-        if (slave_conn[conn_handle]) {
-            slave_conn[conn_handle] = 0;
+        struct ble_gap_conn_track *track = ble_gap_conn_track_find(conn_handle);
+
+        if (track != NULL && track->slave_conn) {
+            track->slave_conn = 0;
 	} else {
 	    send = 0;
 	}
@@ -1610,10 +1699,7 @@ ble_gap_conn_broken(uint16_t conn_handle, int reason)
 
     ble_hs_atomic_conn_delete(conn_handle);
 
-    g_max_tx_time[conn_handle] = 0;
-    g_max_rx_time[conn_handle] = 0;
-    g_max_tx_octets[conn_handle] = 0;
-    g_max_rx_octets[conn_handle] = 0;
+    ble_gap_conn_track_free(conn_handle);
 
     event.type = BLE_GAP_EVENT_DISCONNECT;
     event.disconnect.reason = reason;
@@ -2841,8 +2927,13 @@ ble_gap_rx_rd_rem_sup_feat_complete(const struct ble_hci_ev_le_subev_rd_rem_used
         }
 
 	if (conn != NULL) {
+            struct ble_gap_conn_track *track;
+
             ble_gap_event_connect_call(ev->conn_handle, ev->status);
-            slave_conn[ev->conn_handle] = 1;
+            track = ble_gap_conn_track_alloc(ev->conn_handle);
+            if (track != NULL) {
+                track->slave_conn = 1;
+            }
         }
     }
 #endif
@@ -2927,10 +3018,16 @@ ble_gap_rx_data_len_change(const struct ble_hci_ev_le_subev_data_len_chg *ev)
     event.data_len_chg.max_tx_time = le16toh(ev->max_tx_time);
     event.data_len_chg.max_rx_time = le16toh(ev->max_rx_time);
 
-    g_max_tx_octets[conn_handle] = event.data_len_chg.max_tx_octets;
-    g_max_rx_octets[conn_handle] = event.data_len_chg.max_rx_octets;
-    g_max_tx_time[conn_handle] = event.data_len_chg.max_tx_time;
-    g_max_rx_time[conn_handle] = event.data_len_chg.max_rx_time;
+    {
+        struct ble_gap_conn_track *track = ble_gap_conn_track_alloc(conn_handle);
+
+        if (track != NULL) {
+            track->max_tx_octets = event.data_len_chg.max_tx_octets;
+            track->max_rx_octets = event.data_len_chg.max_rx_octets;
+            track->max_tx_time = event.data_len_chg.max_tx_time;
+            track->max_rx_time = event.data_len_chg.max_rx_time;
+        }
+    }
 
     ble_gap_event_listener_call(&event);
     ble_gap_call_conn_event_cb(&event, conn_handle);
@@ -8026,22 +8123,27 @@ ble_gap_set_data_len(uint16_t conn_handle, uint16_t tx_octets,
      * If yes, then just return event to host indicating success
      * since controller will not send any event in this scenario
      */
-    if (g_max_tx_time[conn_handle] == tx_time && g_max_tx_octets[conn_handle] == tx_octets) {
+    {
+        struct ble_gap_conn_track *track = ble_gap_conn_track_find(conn_handle);
 
-        struct ble_gap_event event;
+        if (track != NULL &&
+                track->max_tx_time == tx_time && track->max_tx_octets == tx_octets) {
 
-        memset(&event, 0, sizeof event);
-        event.type = BLE_GAP_EVENT_DATA_LEN_CHG;
-        event.data_len_chg.max_tx_octets = g_max_tx_octets[conn_handle];
-        event.data_len_chg.max_rx_octets = g_max_rx_octets[conn_handle];
-        event.data_len_chg.max_tx_time = g_max_tx_time[conn_handle];
-        event.data_len_chg.max_rx_time = g_max_rx_time[conn_handle];
-        event.data_len_chg.conn_handle = conn_handle;
+            struct ble_gap_event event;
 
-        ble_gap_event_listener_call(&event);
-        ble_gap_call_conn_event_cb(&event, conn_handle);
+            memset(&event, 0, sizeof event);
+            event.type = BLE_GAP_EVENT_DATA_LEN_CHG;
+            event.data_len_chg.max_tx_octets = track->max_tx_octets;
+            event.data_len_chg.max_rx_octets = track->max_rx_octets;
+            event.data_len_chg.max_tx_time = track->max_tx_time;
+            event.data_len_chg.max_rx_time = track->max_rx_time;
+            event.data_len_chg.conn_handle = conn_handle;
 
-	return 0;
+            ble_gap_event_listener_call(&event);
+            ble_gap_call_conn_event_cb(&event, conn_handle);
+
+            return 0;
+        }
     }
 
     return ble_hs_hci_util_set_data_len(conn_handle, tx_octets, tx_time);
@@ -9020,9 +9122,14 @@ int
 ble_gap_init(void)
 {
     int rc;
+    int i;
 
     memset(&ble_gap_master, 0, sizeof(ble_gap_master));
     memset(ble_gap_slave, 0, sizeof(ble_gap_slave));
+
+    for (i = 0; i < MYNEWT_VAL(BLE_MAX_CONNECTIONS); i++) {
+        ble_gap_conn_tracks[i].conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    }
 
 #if MYNEWT_VAL(OPTIMIZE_MULTI_CONN)
     memset(&ble_gap_multi_conn, 0, sizeof(ble_gap_multi_conn));

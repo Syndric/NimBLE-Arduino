@@ -97,6 +97,7 @@ void ble_gap_rx_adv_report(struct ble_gap_disc_desc *desc);
 void ble_gap_rx_rd_rem_sup_feat_complete(const struct ble_hci_ev_le_subev_rd_rem_used_feat *ev);
 void ble_gap_rx_rd_rem_ver_info_complete(const struct ble_hci_ev_rd_rem_ver_info_cmp *ev);
 void ble_gap_event_connect_call(uint16_t conn_handle, int status);
+int ble_gap_conn_track_is_slave_conn(uint16_t conn_handle);
 #if MYNEWT_VAL(BLE_CONN_SUBRATING)
 void ble_gap_rx_subrate_change(const struct ble_hci_ev_le_subev_subrate_change *ev);
 #endif
