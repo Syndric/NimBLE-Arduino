@@ -37,6 +37,7 @@ struct ble_gap_reattempt_ctxt {
 
 extern int ble_gap_master_connect_reattempt(uint16_t conn_handle);
 extern int ble_gap_slave_adv_reattempt(void);
+extern int ble_gap_conn_broken_reattempt(uint16_t conn_handle, int reason);
 #endif
 
 #if MYNEWT_VAL(BLE_QUEUE_CONG_CHECK)
@@ -290,39 +291,8 @@ ble_hs_hci_evt_disconn_complete(uint8_t event_code, const void *data,
 
 	    BLE_HS_LOG(INFO, "Reattempt advertising; reason: 0x%x, status = %x",
                              ev->reason, ev->status);
-            ble_l2cap_sig_conn_broken(ev->conn_handle, BLE_ERR_CONN_ESTABLISHMENT);
-            ble_sm_connection_broken(ev->conn_handle);
-            ble_gatts_connection_broken(ev->conn_handle);
-            ble_gattc_connection_broken(ev->conn_handle);
-            ble_hs_flow_connection_broken(ev->conn_handle);;
-#if MYNEWT_VAL(BLE_GATT_CACHING)
-            ble_gattc_cache_conn_broken(ev->conn_handle);
-#endif
-            rc = ble_hs_atomic_conn_delete(ev->conn_handle);
-            if (rc != 0) {
-                return rc;
-            }
 
-            /* This path bypasses ble_gap_conn_broken() (the normal
-             * disconnect handler), which is the only other place that
-             * frees a conn_track slot -- without this, every connection
-             * attempt that lands here (the common case: a plain failed
-             * connect, BLE_ERR_CONN_ESTABLISHMENT) permanently leaks one
-             * of the fixed BLE_MAX_CONNECTIONS track slots. Once all
-             * slots leak, ble_gap_conn_track_alloc() can no longer mark
-             * *any* new connection as slave_conn, so a later genuine
-             * supervision timeout on an established link misreads as
-             * "connect never finished" and takes this same silent
-             * restart-advertising path instead of delivering
-             * BLE_GAP_EVENT_DISCONNECT -- the connection appears to the
-             * app to just drop and immediately reconnect.
-             */
-            ble_gap_conn_track_free(ev->conn_handle);
-
-            rc = ble_gap_slave_adv_reattempt();
-            if (rc != 0) {
-                BLE_HS_LOG(INFO, "Adv reattempt failed; rc= %d ", rc);
-            }
+            ble_gap_conn_broken_reattempt(ev->conn_handle, BLE_HS_HCI_ERR(ev->reason));
 
             return 0;  // Restart advertising, so don't post disconnect event
 	} else {

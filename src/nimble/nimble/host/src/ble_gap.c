@@ -390,7 +390,7 @@ ble_gap_conn_track_alloc(uint16_t conn_handle)
     return NULL;
 }
 
-void
+static void
 ble_gap_conn_track_free(uint16_t conn_handle)
 {
     struct ble_gap_conn_track *track;
@@ -1724,6 +1724,69 @@ ble_gap_update_to_l2cap(const struct ble_gap_upd_params *params,
     l2cap_params->timeout_multiplier = params->supervision_timeout;
 }
 #endif
+
+/* Tears down a connection that's being treated as a failed/never-finished
+ * connect attempt (see the BLE_ERR_CONN_ESTABLISHMENT / early-SPVN_TMO
+ * branch in ble_hs_hci_evt_disconn_complete()) and restarts advertising,
+ * all without normally telling the app anything -- from the app's point
+ * of view nothing ever connected, so there's nothing to report.
+ *
+ * That silence is only safe as long as the advertising restart actually
+ * works every time: ble_gap_slave_adv_reattempt() does not retry itself,
+ * so if it fails here the peripheral is left not advertising with no one
+ * -- library or app -- aware there's anything to recover. Snapshot the
+ * connection before tearing it down and, if the restart fails, deliver
+ * BLE_GAP_EVENT_DISCONNECT anyway so the app's own reconnect/advertise
+ * logic gets a chance to notice and retry instead of advertising staying
+ * dead until reboot.
+ */
+int
+ble_gap_conn_broken_reattempt(uint16_t conn_handle, int reason)
+{
+#if NIMBLE_BLE_CONNECT
+    struct ble_gap_event event;
+    struct ble_gap_snapshot snap;
+    int have_snap;
+    int rc;
+
+    memset(&event, 0, sizeof event);
+    snap.desc = &event.disconnect.conn;
+    have_snap = (ble_gap_find_snapshot(conn_handle, &snap) == 0);
+
+    ble_l2cap_sig_conn_broken(conn_handle, BLE_ERR_CONN_ESTABLISHMENT);
+    ble_sm_connection_broken(conn_handle);
+    ble_gatts_connection_broken(conn_handle);
+    ble_gattc_connection_broken(conn_handle);
+    ble_hs_flow_connection_broken(conn_handle);
+#if MYNEWT_VAL(BLE_GATT_CACHING)
+    ble_gattc_cache_conn_broken(conn_handle);
+#endif
+
+    rc = ble_hs_atomic_conn_delete(conn_handle);
+    if (rc != 0) {
+        return rc;
+    }
+
+    ble_gap_conn_track_free(conn_handle);
+
+    rc = ble_gap_slave_adv_reattempt();
+    if (rc != 0) {
+        BLE_HS_LOG(INFO, "Adv reattempt failed; rc= %d ", rc);
+
+        if (have_snap) {
+            event.type = BLE_GAP_EVENT_DISCONNECT;
+            event.disconnect.reason = reason;
+
+            ble_gap_event_listener_call(&event);
+            ble_gap_call_event_cb(&event, snap.cb, snap.cb_arg);
+        }
+    }
+
+    return 0;
+#else
+    return BLE_HS_ENOTSUP;
+#endif
+}
 
 void
 ble_gap_rx_disconn_complete(const struct ble_hci_ev_disconn_cmp *ev)
