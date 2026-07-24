@@ -45,9 +45,25 @@ ble_hs_conn_can_alloc(void)
     return 0;
 #endif
 
-    return ble_hs_conn_pool.mp_num_free >= 1 &&
-           ble_l2cap_chan_pool.mp_num_free >= BLE_HS_CONN_MIN_CHANS &&
-           ble_gatts_conn_can_alloc();
+    int conn_ok  = ble_hs_conn_pool.mp_num_free >= 1;
+    int l2cap_ok = ble_l2cap_chan_pool.mp_num_free >= BLE_HS_CONN_MIN_CHANS;
+    int gatts_ok = ble_gatts_conn_can_alloc();
+
+    if (!conn_ok || !l2cap_ok || !gatts_ok) {
+        /* Diagnostic: pin down which fixed-size pool is stuck when a new
+         * connection can't be allocated (see the "stuck below max until
+         * every peer disconnects" report -- one of these three should be
+         * sitting at 0 free without a matching drop in real connection
+         * count).
+         */
+        BLE_HS_LOG(INFO, "ble_hs_conn_can_alloc: denied -- conn_pool free=%d/%d "
+                         "l2cap_pool free=%d/%d gatts_ok=%d\n",
+                   ble_hs_conn_pool.mp_num_free, ble_hs_conn_pool.mp_num_blocks,
+                   ble_l2cap_chan_pool.mp_num_free, ble_l2cap_chan_pool.mp_num_blocks,
+                   gatts_ok);
+    }
+
+    return conn_ok && l2cap_ok && gatts_ok;
 }
 
 struct ble_l2cap_chan *
