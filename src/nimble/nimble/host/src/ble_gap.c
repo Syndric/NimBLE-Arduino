@@ -390,7 +390,7 @@ ble_gap_conn_track_alloc(uint16_t conn_handle)
     return NULL;
 }
 
-static void
+void
 ble_gap_conn_track_free(uint16_t conn_handle)
 {
     struct ble_gap_conn_track *track;
